@@ -1,6 +1,10 @@
-#include <pcap.h>
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <pcap.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>
@@ -12,6 +16,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <math.h>
+#include <string.h>
 
 #define SNAP_LEN 1518
 #define SIZE_ETHERNET 14
@@ -86,13 +91,18 @@ void detect();
 void* checkSyn(void*);
 void find_diff_in_syn();
 void find_diff_in_syn_and_syn_ack_diff();
+void log_ip(char*, int);
+void log_helper(char*, int, int);
+
+FILE* log_file;
 
 struct suspect* suspects[MAX_NUMBER_OF_SUSPECTS];
 int count = 0;
 int syn_count = 0;
 
+
 int
-main(int argc, char **argv) {
+start_sniffing() {
 	char* dev = NULL;     /* capture device name */
 	char errbuf[PCAP_ERRBUF_SIZE];     /* error buffer */
 	pcap_t* handle;     /* packet capture handle */
@@ -128,14 +138,11 @@ main(int argc, char **argv) {
 	}
 
 	int c = 1;
-	/* -- Start detection -- */
 	detect();
 
 	while(1) {
 		int failed = pcap_loop(handle, 1, got_packet, NULL);
 		if (failed) exit(1);
-		// if (c % 50 == 0) print_suspects(count);
-		// if (c % 150 == 0) print_suspects(count);
 		c++;
 	}
 
@@ -151,21 +158,9 @@ void
 got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
 	const struct sniff_ip *ip = (struct sniff_ip*)(packet + SIZE_ETHERNET);
 	int size_ip = IP_HL(ip)*4;
-
-	// Invalid IP header length
-	// if (size_ip < 20) return;
-
-	// We don't care about non-TCP requests
-	// if (ip->ip_p != IPPROTO_TCP) return;
-
 	const struct sniff_tcp *tcp = (struct sniff_tcp*)(packet + SIZE_ETHERNET + size_ip);
-	// int size_tcp = TH_OFF(tcp)*4;
-
-	// Invalid TCP header length
-	// if (size_tcp < 20) return;
 
 	char* suspect_ip = inet_ntoa(ip->ip_src);
-	// printf("IP: %s, FLAG: %d\n", suspect_ip, tcp->th_flags);
 	switch (tcp->th_flags) {
 	case TH_SYN:
 		find_and_increase(suspect_ip, 0, 1);
@@ -274,11 +269,13 @@ detect() {
 
 void*
 checkSyn(void *arg) {
+	int c = 0;
 	while(1) {
-		sleep(5);
-		print_suspects(count);
+		sleep(4);
 		find_diff_in_syn();
+		sleep(1);
 		find_diff_in_syn_and_syn_ack_diff();
+		c++;
 	}
 	pthread_exit(0);
 }
@@ -287,9 +284,9 @@ char* reported_ip[MAX_NUMBER_OF_SUSPECTS];
 int reported_count = 0;
 
 int
-contains(char** sig, int count, char* ip) {
-	for (size_t i = 0; i < count; ++i) {
-		int eq = strcmp(sig[count], ip) == 0;
+contains(char* ip) {
+	for (size_t i = 0; i < reported_count; ++i) {
+		int eq = strcmp(reported_ip[reported_count], ip) == 0;
 		if (eq) return 1;
 	}
 	return 0;
@@ -297,47 +294,74 @@ contains(char** sig, int count, char* ip) {
 
 void
 find_diff_in_syn() {
-	puts("syn");
 	for (size_t i = 0; i < count; i++) {
 		if (suspects[i]) {
 			char* ip = suspects[i]->ip;
-			if (!contains(reported_sig1, n_sig1_trigg, ip)) {
-				int syn = suspects[i]->syn;
-				int prev_syn = suspects[i]->prev_syn;
-				int diff = syn - prev_syn;
-				if (!prev_syn && diff > 10) {
-					printf("The IP %s scanned %d port in 10 seconds.\n", ip, diff);
-					puts("Adding reported_ips");
-					printf("IP COUNT: %d, REPORTED IP: %s\n", n_sig1_trigg, ip);
-					reported_sig1[n_sig1_trigg++] = ip;
-					puts("Added reported_ips");
-				}
-				suspects[i]->prev_syn = suspects[i]->syn;
-			};
+			int syn = suspects[i]->syn;
+			int prev_syn = suspects[i]->prev_syn;
+			int diff = syn - prev_syn;
+			if (!prev_syn && diff > 4) log_ip(ip, 1);
+			suspects[i]->prev_syn = suspects[i]->syn;
 		}
 	}
 }
 
 void
 find_diff_in_syn_and_syn_ack_diff() {
-	puts("syn_ack");
 	for (size_t i = 0; i < count; i++) {
 		if (suspects[i]) {
 			char* ip = suspects[i]->ip;
-			if (!contains(reported_sig2, n_sig2_trigg, ip)) {
-				int syn = suspects[i]->syn;
-				int syn_ack = suspects[i]->n_syn_ack;
-				if (syn_ack) {
-					int harmful_ratio = ceil(syn / syn_ack) > SYN_SYNACK_RATIO;
-					if (harmful_ratio) {
-						printf("The IP %s have %d SYN and %d SYN_ACK.\n", ip, syn, syn_ack);
-						puts("Adding reported_ips");
-						printf("IP COUNT: %d, REPORTED IP: %s\n", n_sig2_trigg, ip);
-						reported_sig2[n_sig2_trigg++] = ip;
-						puts("Added reported_ips");
-					}
-				}
+			int syn = suspects[i]->syn;
+			int syn_ack = suspects[i]->n_syn_ack;
+			if (syn_ack) {
+				int harmful_ratio = ceil(syn / syn_ack) > SYN_SYNACK_RATIO;
+				if (harmful_ratio) log_ip(ip, 0);
 			}
+
 		}
 	}
+}
+
+void
+log_ip(char* ip, int sig) {
+	int previously_reported = contains(ip);
+	if (previously_reported) {
+		log_helper(ip, 0, 0);
+	} else {
+		log_helper(ip, 1, sig);
+	}
+}
+
+void
+log_helper(char* ip, int is_single, int sig) {
+	log_file = fopen("log.txt", "ab+");     /* 0444 log file */
+	if (is_single) fprintf(log_file, "%s: %s\n", sig ? "SIG1" : "SIG2", ip);
+	else fprintf(log_file, "SIG1 & SIG2: %s\n", ip);
+	fclose(log_file);
+}
+
+static void
+skeleton_daemon() {
+	pid_t pid;
+	pid = fork();
+	if (pid < 0) exit(EXIT_FAILURE);
+	if (pid > 0) exit(EXIT_SUCCESS);
+	if (setsid() < 0) exit(EXIT_FAILURE);
+	signal(SIGCHLD, SIG_IGN);
+	signal(SIGHUP, SIG_IGN);
+
+	pid = fork();
+	if (pid < 0) exit(EXIT_FAILURE);
+	if (pid > 0) exit(EXIT_SUCCESS);
+	umask(0);
+}
+
+int
+main() {
+	skeleton_daemon();
+	while(1) {
+		start_sniffing();
+	}
+
+	return EXIT_SUCCESS;
 }

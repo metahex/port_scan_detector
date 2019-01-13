@@ -3,6 +3,8 @@
 *.profraw
 *.pages
 *.pdf
+.DS_Store
+detector
 
 # Prerequisites
 *.d
@@ -56,4 +58,3 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
-
