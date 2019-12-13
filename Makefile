@@ -15,3 +15,5 @@ finale:
 
 clean:
 	rm -f *.o *.out
+install:
+	sudo cp detector /usr/bin/detector
